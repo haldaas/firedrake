@@ -117,9 +117,7 @@ throughout::
 
 Every matrix here is symmetric positive definite, and so is the coarse problem
 built from them, so all the direct solves are Cholesky factorisations rather
-than LU. That halves their cost, and on the coarse problem it matters for more
-than cost: asking for ``lu`` there was measured to cost several times as many
-iterations on this problem, converging to the same answer but far more slowly.
+than LU, halving their cost.
 
 For a baseline we take classical one-level additive Schwarz, PETSc's
 ``PCASM``::

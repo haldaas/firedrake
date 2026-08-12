@@ -38,9 +38,9 @@ class HPDDMPC(PCBase):
     - ``'hpddm_pc_hpddm_levels_1_st_pc_type'`` for the eigensolver's spectral
     transformation,
     - ``'hpddm_pc_hpddm_coarse_'`` to set the coarse solver KSP,
-    - ``'hpddm_pc_hpddm_levels_1_st_share_sub_ksp'`` to solve the eigenproblem
-    with the same factorisation as the subdomain solve, instead of building a
-    second one,
+    - ``'hpddm_pc_hpddm_levels_1_st_share_sub_ksp'`` to reuse the analysis
+    factorisation information performed during the ASM setup to factor the
+    Neumann matrix when solving the eigenproblem, instead of repeating it,
     - ``'hpddm_pc_hpddm_levels_1_pc_asm_type'`` for the one-level method, which
     this PC defaults to ``'basic'`` rather than PETSc's ``'restrict'``,
     - ``'hpddm_pc_hpddm_coarse_correction'`` for the coarse correction, which
@@ -52,11 +52,8 @@ class HPDDMPC(PCBase):
     both to use the PETSc defaults under a method such as GMRES, which
     converges in fewer iterations.
 
-    For a symmetric positive definite operator the coarse problem is too, so
-    solve it with ``'cholesky'`` rather than ``'lu'``.  Beyond costing twice the
-    work, ``'lu'`` was measured to need several times as many iterations on the
-    problems tested here, converging to the same answer but more slowly; PETSc's
-    default coarse solver does not show this.
+    For a symmetric positive definite operator the coarse problem is SPD too, so
+    solve it with ``'cholesky'`` rather than ``'lu'``.
 
     Not supported on extruded meshes, because the subdomain matrix is assembled
     on a submesh and a submesh of an extruded mesh cannot be built.
@@ -120,8 +117,8 @@ class HPDDMPC(PCBase):
         hpddmpc.setOperators(A, P)
         hpddmpc.setHPDDMAuxiliaryMat(iset, self.aux)
         # The auxiliary matrix we just supplied really is the local Neumann
-        # matrix, so say so.  This only records the fact: it saves PCHPDDM
-        # extracting submatrices to build the eigenproblem, and it is what
+        # matrix. This only records the fact: it tells PCHPDDM that we supplied
+        # the right-hand side matrix in the GenEO eigenproblem, and it is what
         # lets the subdomain factorisation be shared with the eigensolver's
         # spectral transformation.  The fine-level solve uses the
         # corresponding block of P either way.
@@ -148,7 +145,7 @@ class HPDDMPC(PCBase):
         # Without an eps_nev or a threshold there is no coarse level at all
         if not any(f"pc_hpddm_levels_1_{k}" in opts
                    for k in ("eps_nev", "eps_threshold_absolute",
-                             "eps_threshold", "svd_nsv")):
+                             "eps_threshold")):
             default("pc_hpddm_levels_1_eps_nev", self.DEFAULT_EPS_NEV)
 
         self.pc = hpddmpc
