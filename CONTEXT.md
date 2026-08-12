@@ -14,8 +14,8 @@ cells or facets carrying a marker, as in `Submesh(mesh, subdomain_id=...)`,
 `Face Sets` labels. It says nothing about parallelism.
 
 **In the domain-decomposition preconditioners** — `firedrake/preconditioners/matis.py`,
-`bddc.py`, and anything built on `Mat` of type `is` — a subdomain is a *piece of
-the decomposition of the operator*: the unit on which a local solve is done, in
+`bddc.py`, `hpddm.py`, and anything built on `Mat` of type `is` — a subdomain is
+a *piece of the decomposition of the operator*: the unit on which a local solve is done, in
 the sense of the domain-decomposition literature. Subdomains need not
 correspond to any marked region, and there may be one per cell, one per MPI
 process, or several per process.
