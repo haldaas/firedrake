@@ -1,5 +1,3 @@
-from itertools import repeat
-
 from firedrake.preconditioners.base import PCBase
 from firedrake.preconditioners.patch import bcdofs
 from firedrake.preconditioners.facet_split import get_restriction_indices
@@ -8,16 +6,13 @@ from firedrake.dmhooks import get_function_space, get_appctx
 from firedrake.ufl_expr import TestFunction, TrialFunction
 from firedrake.function import Function
 from firedrake.functionspace import FunctionSpace, TensorFunctionSpace
-from firedrake.preconditioners.fdm import broken_function, tabulate_exterior_derivative
+from firedrake.preconditioners.fdm import tabulate_exterior_derivative
 from firedrake.preconditioners.hiptmair import curl_to_grad
-from functools import cached_property
+from firedrake.preconditioners.matis import create_matis, local_subdomains
 
 from firedrake.parloops import par_loop, INC, READ
-from firedrake.bcs import DirichletBC
-from firedrake.mesh import Submesh
-from ufl import Form, H1, H2, JacobianDeterminant, div, dx, inner, replace
-from finat.ufl import BrokenElement, TensorElement, VectorElement
-from pyop2.mpi import COMM_SELF
+from ufl import H1, H2, JacobianDeterminant, div, dx, inner
+from finat.ufl import TensorElement, VectorElement
 from pyop2.utils import as_tuple
 import numpy
 
@@ -32,6 +27,14 @@ class BDDCPC(PCBase):
     Internally, this PC creates a PETSc PCBDDC object that can be controlled by
     the options:
     - ``'bddc_cellwise'`` to set up a MatIS on cellwise subdomains if P.type == python,
+    - ``'bddc_subdomain_size'`` to set up a MatIS on several subdomains per process if
+    P.type == python, holding this many cells each.  The size is a target, not a
+    guarantee: the cells of each process are split by a graph partitioner, and any
+    disconnected subdomain is split further.  A size of 1 is ``'bddc_cellwise'``, and a
+    size of at least the number of cells owned by a process gives one subdomain per
+    process, which is the default.  Not supported together with ``'bddc_cellwise'`` or
+    ``'bddc_matfree'``, nor on extruded meshes, nor for H(div) and H(curl) problems
+    needing the divergence matrix or the discrete gradient,
     - ``'bddc_matfree'`` to set up a matrix-free MatIS if A.type == python,
     - ``'bddc_pc_bddc_neumann'`` to set sub-KSPs on subdomains excluding corners,
     - ``'bddc_pc_bddc_dirichlet'`` to set sub-KSPs on subdomain interiors,
@@ -67,15 +70,39 @@ class BDDCPC(PCBase):
 
         opts = PETSc.Options(bddcpc.getOptionsPrefix())
         matfree = opts.getBool("matfree", False)
+        subdomain_size = opts.getInt("subdomain_size", 0)
+
+        mesh = V.mesh().unique()
+        if subdomain_size > 0:
+            if matfree:
+                raise NotImplementedError(
+                    "'bddc_subdomain_size' does not work with 'bddc_matfree', because "
+                    "several subdomains per process need an assembled subdomain matrix.")
+            if mesh.extruded:
+                raise NotImplementedError(
+                    "'bddc_subdomain_size' does not work on extruded meshes, because "
+                    "a submesh of an extruded mesh cannot be built.")
 
         # Set operators
         assemblers = []
         A, P = pc.getOperators()
+        subdomains = None
         if P.type == "python":
             # Reconstruct P as MatIS
             cellwise = opts.getBool("cellwise", False)
-            P, assembleP = create_matis(P, "aij", cellwise=cellwise)
+            if subdomain_size > 0:
+                if cellwise:
+                    raise ValueError(
+                        "Set either 'bddc_cellwise' or 'bddc_subdomain_size', not both. "
+                        "Cellwise subdomains are 'bddc_subdomain_size' of 1.")
+                subdomains = local_subdomains(mesh, subdomain_size)
+            P, assembleP = create_matis(P, "aij", cellwise=cellwise, subdomains=subdomains)
             assemblers.append(assembleP)
+        elif subdomain_size > 0:
+            raise ValueError(
+                f"'bddc_subdomain_size' needs a 'matfree' P to reassemble, not '{P.type}'. "
+                "To choose the subdomains of a P assembled as 'is', see the "
+                "'mat_is_allow_repeated' option of the assembler.")
 
         if P.type != "is":
             raise ValueError(f"Expecting P to be either 'matfree' or 'is', not {P.type}.")
@@ -102,7 +129,6 @@ class BDDCPC(PCBase):
 
         # Handle boundary dofs
         bcs = tuple(ctx._problem.dirichlet_bcs())
-        mesh = V.mesh().unique()
         if mesh.extruded and not mesh.extruded_periodic:
             boundary_nodes = numpy.unique(numpy.concatenate(list(map(V.boundary_nodes, ("on_boundary", "top", "bottom")))))
         else:
@@ -139,6 +165,13 @@ class BDDCPC(PCBase):
         tdim = mesh.topological_dimension
         use_divergence = opts.getBool("use_divergence_mat", tdim >= 2 and V.finat_element.formdegree == tdim-1)
         use_gradient = opts.getBool("use_discrete_gradient", tdim >= 3 and V.finat_element.formdegree == 1)
+
+        if (use_divergence or use_gradient) and subdomains is not None:
+            raise NotImplementedError(
+                "'bddc_subdomain_size' does not work with the divergence matrix or the "
+                "discrete gradient, which are decomposed either per cell or per process. "
+                "Decomposing them the same way as the operator is not implemented, and "
+                "decomposing them differently would give a wrong answer.")
 
         if use_divergence:
             allow_repeated = P.getISAllowRepeated()
@@ -188,113 +221,6 @@ class BDDCPC(PCBase):
 
     def applyTranspose(self, pc, x, y):
         self.pc.applyTranspose(x, y)
-
-
-class BrokenDirichletBC(DirichletBC):
-    def __init__(self, bc):
-        self.bc = bc
-        V = bc.function_space().broken_space()
-        g = bc._original_arg
-        super().__init__(V, g, bc.sub_domain)
-
-    @cached_property
-    def nodes(self):
-        u = Function(self.bc.function_space())
-        self.bc.set(u, 1)
-        u = broken_function(u.function_space(), val=u.dat)
-        return numpy.flatnonzero(u.dat.data)
-
-
-def create_matis(a, local_mat_type, cellwise=False, bcs=()):
-    from firedrake.assemble import get_assembler
-
-    def local_mesh(mesh):
-        key = "local_submesh"
-        cache = mesh._shared_data_cache["local_submesh_cache"]
-        try:
-            return cache[key]
-        except KeyError:
-            if mesh.comm.size > 1:
-                submesh = Submesh(mesh, ignore_halo=True, comm=COMM_SELF)
-            else:
-                submesh = None
-            return cache.setdefault(key, submesh)
-
-    def local_space(V, cellwise):
-        mesh = local_mesh(V.mesh().unique())
-        element = BrokenElement(V.ufl_element()) if cellwise else None
-        return V.reconstruct(mesh=mesh, element=element)
-
-    def local_argument(arg, cellwise):
-        return arg.reconstruct(function_space=local_space(arg.function_space(), cellwise))
-
-    def local_integral(it):
-        extra_domain_integral_type_map = dict(it.extra_domain_integral_type_map())
-        extra_domain_integral_type_map[it.ufl_domain()] = it.integral_type()
-        return it.reconstruct(domain=local_mesh(it.ufl_domain()),
-                              extra_domain_integral_type_map=extra_domain_integral_type_map)
-
-    def local_bc(bc, cellwise):
-        V = bc.function_space()
-        Vsub = local_space(V, False)
-        sub_domain = list(bc.sub_domain)
-        if "on_boundary" in sub_domain:
-            sub_domain.remove("on_boundary")
-            sub_domain.extend(V.mesh().unique().exterior_facets.unique_markers)
-
-        valid_markers = Vsub.mesh().unique().exterior_facets.unique_markers
-        sub_domain = list(set(sub_domain) & set(valid_markers))
-        bc = bc.reconstruct(V=Vsub, g=0, sub_domain=sub_domain)
-        if cellwise:
-            bc = BrokenDirichletBC(bc)
-        return bc
-
-    def local_to_global_map(V, cellwise):
-        u = Function(V)
-        shp = u.dat.data_ro.shape
-        u.dat.data_wo[...] = numpy.arange(*V.dof_dset.layout_vec.getOwnershipRange()).reshape(shp)
-
-        Vsub = local_space(V, False)
-        usub = Function(Vsub).assign(u)
-        if cellwise:
-            usub = broken_function(usub.function_space(), val=usub.dat)
-        indices = usub.dat.data_ro.astype(PETSc.IntType)
-        return PETSc.LGMap().create(indices, comm=V.comm)
-
-    if isinstance(a, Form):
-        form = a
-        args = a.arguments()
-        comm = args[0].function_space().comm
-        sizes = tuple(arg.function_space().dof_dset.layout_vec.getSizes() for arg in args)
-    elif isinstance(a, PETSc.Mat):
-        assert a.type == "python"
-        ctx = a.getPythonContext()
-        form = ctx.a
-        bcs = ctx.bcs
-        comm = a.comm
-        sizes = a.getSizes()
-
-    local_form = replace(form, {arg: local_argument(arg, cellwise) for arg in form.arguments()})
-    local_form = Form(list(map(local_integral, local_form.integrals())))
-    local_bcs = tuple(map(local_bc, bcs, repeat(cellwise)))
-
-    assembler = get_assembler(local_form, bcs=local_bcs, mat_type=local_mat_type)
-    tensor = assembler.assemble()
-
-    rmap = local_to_global_map(form.arguments()[0].function_space(), cellwise)
-    cmap = local_to_global_map(form.arguments()[1].function_space(), cellwise)
-
-    Amatis = PETSc.Mat().createIS(sizes, comm=comm)
-    Amatis.setISAllowRepeated(cellwise)
-    Amatis.setLGMap(rmap, cmap)
-    Amatis.setISLocalMat(tensor.petscmat)
-    Amatis.setUp()
-    Amatis.assemble()
-
-    def update():
-        assembler.assemble(tensor=tensor)
-        Amatis.assemble()
-    return Amatis, update
 
 
 def get_restricted_dofs(V, domain):
