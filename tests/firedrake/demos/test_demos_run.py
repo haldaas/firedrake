@@ -59,6 +59,7 @@ SERIAL_DEMOS = [
 ]
 PARALLEL_DEMOS = [
     Demo(("full_waveform_inversion", "full_waveform_inversion"), ["adjoint"]),
+    Demo(("hpddm", "hpddm_skyscraper"), ["hpddm", "slepc"]),
 ]
 
 

@@ -31,6 +31,7 @@ element systems.
    Vertex/edge star multigrid relaxation for H(div).<demos/hdiv_riesz_star.py>
    Auxiliary space patch relaxation multigrid for H(curl).<demos/hcurl_riesz_star.py>
    Preconditioning using fast diagonalisation.<demos/fast_diagonalisation_poisson.py>
+   A robust GenEO coarse space for highly heterogeneous diffusion.<demos/hpddm_skyscraper.py>
    Shape optimisation.<demos/shape_optimization.py>
    Steady Boussinesq problem with integral constraints.<demos/boussinesq.py>
    Steady multicomponent flow -- microfluidic mixing of hydrocarbons.<demos/multicomponent.py>
