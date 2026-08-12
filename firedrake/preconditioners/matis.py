@@ -476,7 +476,8 @@ update : callable
 
 
 def local_neumann_matrix(a, local_mat_type, cellwise=False, bcs=(),
-                         ignore_halo=True, subdomains=None):
+                         ignore_halo=True, subdomains=None,
+                         scale_bc_diagonal=True):
     """Assemble the subdomain (Neumann) matrix of a form on the serial submesh.
 
     Parameters
@@ -498,6 +499,13 @@ def local_neumann_matrix(a, local_mat_type, cellwise=False, bcs=(),
         A DG(0) :class:`~.Function` partitioning the cells of the submesh,
         giving several subdomains per process.  Mutually exclusive with
         ``cellwise``.
+    scale_bc_diagonal : bool
+        Whether to divide the Dirichlet diagonal by the number of subdomains
+        holding each degree of freedom, see :func:`bc_diagonal_scaling`.  This
+        is correct when the subdomain matrices are summed to form the operator,
+        as they are in a ``MATIS``, and wrong for a consumer such as
+        ``PCHPDDM``, which applies its own partition of unity and needs a true
+        Neumann matrix carrying ones there.
 
     Returns
     -------
@@ -538,6 +546,11 @@ def local_neumann_matrix(a, local_mat_type, cellwise=False, bcs=(),
 
         valid_markers = Vsub.mesh().unique().exterior_facets.unique_markers
         sub_domain = list(set(sub_domain) & set(valid_markers))
+        if not sub_domain:
+            # This subdomain does not touch the constrained boundary, so it
+            # carries no condition at all.  A DirichletBC on no markers is not
+            # the same thing: it has no nodes to concatenate and raises.
+            return None
         bc = bc.reconstruct(V=Vsub, g=0, sub_domain=sub_domain)
         if broken:
             bc = BrokenDirichletBC(bc)
@@ -569,7 +582,7 @@ def local_neumann_matrix(a, local_mat_type, cellwise=False, bcs=(),
 
     local_form = replace(form, {arg: local_argument(arg, broken) for arg in form.arguments()})
     local_form = Form(list(map(local_integral, local_form.integrals())))
-    local_bcs = tuple(map(local_bc, bcs, repeat(broken)))
+    local_bcs = tuple(filter(None, map(local_bc, bcs, repeat(broken))))
 
     assembler = get_assembler(local_form, bcs=local_bcs, mat_type=local_mat_type)
     tensor = assembler.assemble()
@@ -605,7 +618,11 @@ def local_neumann_matrix(a, local_mat_type, cellwise=False, bcs=(),
 
     rmap = PETSc.LGMap().create(rindices, comm=comm)
     cmap = PETSc.LGMap().create(cindices, comm=comm)
-    rescale = bc_diagonal_scaling(mat, Vrow, bcs, rindices, cindices, comm)
+    if scale_bc_diagonal:
+        rescale = bc_diagonal_scaling(mat, Vrow, bcs, rindices, cindices, comm)
+    else:
+        def rescale():
+            pass
     rescale()
 
     def update():
