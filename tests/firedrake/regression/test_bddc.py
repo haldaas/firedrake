@@ -11,7 +11,7 @@ def rg():
     return RandomGenerator(PCG64(seed=123456789))
 
 
-def bddc_params(mat_type="is", cellwise=False, adaptive=False,
+def bddc_params(mat_type="is", cellwise=False, subdomain_size=None, adaptive=False,
                 use_divergence=None, use_gradient=None, corner_selection=None, debug=0):
     chol = {
         "pc_type": "cholesky",
@@ -27,6 +27,9 @@ def bddc_params(mat_type="is", cellwise=False, adaptive=False,
         "bddc_pc_bddc_coarse": chol,
         "bddc_debug": debug,
     }
+    if subdomain_size is not None:
+        # several subdomains per process, of roughly this many cells each
+        sp["bddc_subdomain_size"] = subdomain_size
     if use_gradient is not None:
         # defaults to True for 3D H(curl) spaces
         sp["bddc_use_discrete_gradient"] = use_gradient
@@ -51,9 +54,13 @@ def bddc_params(mat_type="is", cellwise=False, adaptive=False,
     return sp
 
 
-def solver_parameters(cellwise=False, condense=False, variant=None, rtol=1E-10, atol=0, **kwargs):
-    mat_type = "matfree" if cellwise and variant != "fdm" else "is"
-    sp_bddc = bddc_params(mat_type=mat_type, cellwise=cellwise, **kwargs)
+def solver_parameters(cellwise=False, subdomain_size=None, condense=False, variant=None,
+                      rtol=1E-10, atol=0, **kwargs):
+    # Several subdomains per process are only built from a 'matfree' P
+    unassembled = cellwise or subdomain_size is not None
+    mat_type = "matfree" if unassembled and variant != "fdm" else "is"
+    sp_bddc = bddc_params(mat_type=mat_type, cellwise=cellwise,
+                          subdomain_size=subdomain_size, **kwargs)
     if variant != "fdm":
         assert not condense
         sp = sp_bddc
@@ -99,7 +106,7 @@ def solver_parameters(cellwise=False, condense=False, variant=None, rtol=1E-10, 
     return sp
 
 
-def solve_riesz_map(rg, mesh, family, degree, variant, bcs, cellwise=False, condense=False, vector=False, threshold=None, elasticity=False):
+def solve_riesz_map(rg, mesh, family, degree, variant, bcs, cellwise=False, subdomain_size=None, condense=False, vector=False, threshold=None, elasticity=False):
     """Solve the riesz map for a random manufactured solution and return the
        square root of the estimated condition number."""
     dirichlet_ids = []
@@ -166,7 +173,8 @@ def solve_riesz_map(rg, mesh, family, degree, variant, bcs, cellwise=False, cond
     problem = LinearVariationalProblem(a, L, uh, bcs=bcs)
 
     rtol = 1E-8
-    sp = solver_parameters(cellwise=cellwise, condense=condense, variant=variant, rtol=rtol,
+    sp = solver_parameters(cellwise=cellwise, subdomain_size=subdomain_size, condense=condense,
+                           variant=variant, rtol=rtol,
                            use_divergence=use_divergence, adaptive=adaptive)
     sp.setdefault("ksp_view_singularvalues", None)
     solver = LinearVariationalSolver(problem, near_nullspace=nsp,
@@ -312,15 +320,19 @@ def test_bddc_elasticity_aij_simplex(rg, family, degree, cellwise):
 @pytest.mark.parallel([1, 3])
 @pytest.mark.parametrize("cellwise", (True, False))
 @pytest.mark.parametrize("local_mat_type", ("aij", "matfree"))
-def test_create_matis(local_mat_type, cellwise):
+@pytest.mark.parametrize("with_bcs", (False, True), ids=("nobcs", "bcs"))
+def test_create_matis(local_mat_type, cellwise, with_bcs):
     from firedrake.preconditioners.bddc import create_matis
+    if with_bcs and local_mat_type == "matfree":
+        pytest.skip("A matrix-free subdomain matrix cannot scale its Dirichlet diagonal")
     mesh = UnitSquareMesh(4, 4)
     V = FunctionSpace(mesh, "CG", 1)
     a = inner(grad(TrialFunction(V)), grad(TestFunction(V)))*dx
-    A = assemble(a, mat_type="matfree").petscmat
+    bcs = [DirichletBC(V, 0, "on_boundary")] if with_bcs else []
+    A = assemble(a, bcs=bcs, mat_type="matfree").petscmat
 
     A, assembler = create_matis(A, local_mat_type, cellwise=cellwise)
-    B = assemble(a, mat_type=local_mat_type).petscmat
+    B = assemble(a, bcs=bcs, mat_type=local_mat_type).petscmat
     if local_mat_type == "matfree":
         Ax, x = A.createVecs()
         Bx, _ = B.createVecs()
@@ -332,3 +344,168 @@ def test_create_matis(local_mat_type, cellwise):
         A.convert("aij")
         B.axpy(-1, A)
         assert np.isclose(B.norm(PETSc.NormType.FROBENIUS), 0)
+
+
+@pytest.mark.parallel([1, 3])
+@pytest.mark.parametrize("target_size", (1, 4, 10**6))
+@pytest.mark.parametrize("with_bcs", (False, True), ids=("nobcs", "bcs"))
+def test_matis_subdomain_size(target_size, with_bcs):
+    """The assembled operator must not depend on how we decompose it.
+
+    For any subdomains, the MatIS is a partial assembly of the same cell-broken
+    matrix.  A full assembly of the MatIS must therefore give the operator.
+    """
+    from firedrake.preconditioners.matis import create_matis, local_subdomains
+    mesh = UnitSquareMesh(4, 4)
+    V = FunctionSpace(mesh, "CG", 2)
+    u, v = TrialFunction(V), TestFunction(V)
+    a = inner(grad(u), grad(v))*dx + inner(u, v)*dx
+    bcs = [DirichletBC(V, 0, "on_boundary")] if with_bcs else []
+    ref = assemble(a, bcs=bcs).petscmat
+
+    subdomains = local_subdomains(mesh, target_size)
+    A, update = create_matis(a, "aij", bcs=bcs, subdomains=subdomains)
+    assert A.getISAllowRepeated()
+    for _ in range(2):
+        D = A.convert("aij", PETSc.Mat())
+        D.axpy(-1, ref)
+        assert np.isclose(D.norm(PETSc.NormType.FROBENIUS), 0, atol=1E-12)
+        # Reassembly must land on the same matrix
+        update()
+
+
+@pytest.mark.parallel([1, 3])
+def test_partition_cells():
+    """Each subdomain must be non-empty and connected, and the ids have no gaps."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    from firedrake.preconditioners.matis import dual_graph, local_mesh, partition_cells
+
+    mesh = UnitSquareMesh(6, 6)
+    lmesh = local_mesh(mesh, ignore_halo=True)
+    if lmesh is None:
+        lmesh = mesh
+    ncells = lmesh.cell_set.size
+    xadj, adjncy = dual_graph(lmesh)
+    graph = csr_matrix((np.ones(adjncy.size), adjncy, xadj), shape=(ncells, ncells))
+
+    for target in (1, 3, ncells, 10**6):
+        ids = partition_cells(lmesh, target).dat.data_ro.astype(int)
+        assert ids.size == ncells
+        nsub = ids.max() + 1
+        assert np.array_equal(np.unique(ids), np.arange(nsub))
+        assert 1 <= nsub <= ncells
+        if target == 1:
+            assert nsub == ncells
+        if target >= ncells:
+            assert nsub == 1
+        for k in range(nsub):
+            cells = np.flatnonzero(ids == k)
+            assert connected_components(graph[cells][:, cells], directed=False)[0] == 1
+
+
+@pytest.mark.parallel([1, 3])
+def test_matis_subdomain_blocks():
+    """The subdomain sizes must add up to the size of the subdomain matrix."""
+    from firedrake.preconditioners.matis import local_neumann_matrix, local_subdomains
+    mesh = UnitSquareMesh(6, 6)
+    V = FunctionSpace(mesh, "CG", 2)
+    a = inner(grad(TrialFunction(V)), grad(TestFunction(V)))*dx
+
+    subdomains = local_subdomains(mesh, 4)
+    nsub = int(subdomains.dat.data_ro.max()) + 1
+    local = local_neumann_matrix(a, "aij", subdomains=subdomains)
+
+    assert local.subdomain_sizes.size == nsub
+    assert (local.subdomain_sizes > 0).all()
+    assert local.subdomain_sizes.sum() == local.mat.getSize()[0]
+    assert local.rmap.getSize() == local.mat.getSize()[0]
+
+
+def test_bddc_subdomain_size_view(tmp_path):
+    """PCBDDC must use the subdomains that we declare, and not choose its own."""
+    from firedrake.preconditioners.matis import local_subdomains
+    mesh = UnitSquareMesh(6, 6)
+    V = FunctionSpace(mesh, "CG", 2)
+    u, v = TrialFunction(V), TestFunction(V)
+    a = inner(grad(u), grad(v))*dx
+    L = inner(Constant(1.0), v)*dx
+    bcs = DirichletBC(V, 0, "on_boundary")
+
+    sp = bddc_params(mat_type="matfree", subdomain_size=8)
+    sp.update({"ksp_type": "cg", "ksp_rtol": 1E-9, "ksp_max_it": 50})
+
+    problem = LinearVariationalProblem(a, L, Function(V), bcs=bcs)
+    solver = LinearVariationalSolver(problem, solver_parameters=sp)
+    solver.solve()
+    assert solver.snes.ksp.getConvergedReason() > 0
+
+    path = str(tmp_path / "pcview.txt")
+    viewer = PETSc.Viewer().createASCII(path, comm=mesh.comm)
+    solver.snes.ksp.pc.view(viewer)
+    viewer.destroy()
+    with open(path) as fh:
+        totals = [line for line in fh if "Total subdomains" in line]
+    assert totals, "PCBDDC did not report a subdomain count"
+    total = int(totals[0].split(":")[1])
+
+    expected = int(local_subdomains(mesh, 8).dat.data_ro.max()) + 1
+    assert total == expected > 1
+
+
+@pytest.mark.parallel([1, 3])
+def test_bddc_subdomain_size_convergence(rg):
+    """Measure the effect of h on the condition number, through the iteration count.
+
+    The subdomain size is a fixed number of cells.  Refinement thus makes the
+    subdomains smaller together with the mesh, and the condition number must
+    become constant.  The first level of the hierarchy is 8x8, because a
+    coarser level is not yet in the asymptotic regime.
+    """
+    base = UnitSquareMesh(8, 8)
+    meshes = MeshHierarchy(base, 2)
+    sqrt_kappa = [solve_riesz_map(rg, m, "CG", 2, None, True, subdomain_size=8)
+                  for m in meshes]
+    assert (np.diff(sqrt_kappa) <= 0.5).all(), str(sqrt_kappa)
+
+
+def test_matis_subdomain_errors():
+    from firedrake.preconditioners.matis import (
+        local_neumann_matrix, local_subdomains, partition_cells)
+    mesh = UnitSquareMesh(4, 4)
+    V = FunctionSpace(mesh, "CG", 1)
+    a = inner(grad(TrialFunction(V)), grad(TestFunction(V)))*dx
+    subdomains = local_subdomains(mesh, 4)
+
+    with pytest.raises(ValueError):
+        local_neumann_matrix(a, "aij", cellwise=True, subdomains=subdomains)
+    with pytest.raises(NotImplementedError):
+        local_neumann_matrix(a, "matfree", subdomains=subdomains)
+    with pytest.raises(ValueError):
+        partition_cells(mesh, 0)
+
+
+@pytest.mark.parametrize("extra,error", [
+    ({"bddc_cellwise": True}, ValueError),
+    ({"bddc_matfree": True}, NotImplementedError),
+    ({"mat_type": "is"}, ValueError),
+])
+def test_bddc_subdomain_size_rejected(extra, error):
+    """An unsupported combination must raise, and not give a wrong answer."""
+    mesh = UnitSquareMesh(4, 4)
+    V = FunctionSpace(mesh, "CG", 1)
+    u, v = TrialFunction(V), TestFunction(V)
+    a = inner(grad(u), grad(v))*dx
+    L = inner(Constant(1.0), v)*dx
+    bcs = DirichletBC(V, 0, "on_boundary")
+
+    sp = bddc_params(mat_type="matfree", subdomain_size=4)
+    sp.update({"ksp_type": "cg", "ksp_max_it": 10})
+    sp.update(extra)
+
+    problem = LinearVariationalProblem(a, L, Function(V), bcs=bcs)
+    solver = LinearVariationalSolver(problem, solver_parameters=sp)
+    # PETSc wraps the error raised while setting up a Python PC
+    with pytest.raises(PETSc.Error) as excinfo:
+        solver.solve()
+    assert isinstance(excinfo.value.__cause__, error)
