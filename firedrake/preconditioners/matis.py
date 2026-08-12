@@ -63,12 +63,19 @@ __all__ = ("partition_cells", "local_subdomains", "local_neumann_matrix", "creat
 def local_mesh(mesh, ignore_halo=True):
     """Return a serial submesh of the cells visible to this process.
 
-    :arg mesh: the distributed mesh.
-    :kwarg ignore_halo: if ``True`` the submesh holds only the cells owned by
-        this process, giving non-overlapping subdomains.  If ``False`` the halo
-        is retained, giving the overlapping subdomains wanted by additive
-        Schwarz methods.
-    :returns: the submesh, or ``None`` if ``mesh`` is already serial.
+    Parameters
+    ----------
+    mesh : MeshGeometry
+        The distributed mesh.
+    ignore_halo : bool
+        If ``True`` the submesh holds only the cells owned by this process,
+        giving non-overlapping subdomains.  If ``False`` the halo is retained,
+        giving the overlapping subdomains wanted by additive Schwarz methods.
+
+    Returns
+    -------
+    MeshGeometry or None
+        The submesh, or ``None`` if ``mesh`` is already serial.
     """
     key = ("local_submesh", ignore_halo)
     cache = mesh._shared_data_cache["local_submesh_cache"]
@@ -92,12 +99,22 @@ def local_space(V, cellwise, ignore_halo=True):
 def partition_cells(mesh, target_size):
     """Partition the cells of a serial mesh into connected subdomains.
 
-    :arg mesh: a serial mesh, typically the one returned by :func:`local_mesh`.
-    :arg target_size: the target number of cells per subdomain.  The number of
-        subdomains is ``round(ncells / target_size)``, at least one and at most
-        the number of cells.
-    :returns: a DG(0) :class:`~.Function` holding the subdomain id of each cell.
+    Parameters
+    ----------
+    mesh : MeshGeometry
+        A serial mesh, typically the one returned by :func:`local_mesh`.
+    target_size : int
+        The target number of cells per subdomain.  The number of subdomains is
+        ``round(ncells / target_size)``, at least one and at most the number of
+        cells.
 
+    Returns
+    -------
+    Function
+        A DG(0) :class:`~.Function` holding the subdomain id of each cell.
+
+    Notes
+    -----
     The partition is computed by PETSc's graph partitioner acting on the dual
     graph of the mesh, so the subdomain size is a target rather than a
     guarantee.  Partitioners routinely return disconnected parts, and a
@@ -145,9 +162,19 @@ def local_subdomains(mesh, target_size, ignore_halo=True):
     :func:`partition_cells`, so that callers need not know whether the mesh is
     distributed.
 
-    :arg mesh: the mesh, distributed or not.
-    :arg target_size: the target number of cells per subdomain.
-    :returns: a DG(0) :class:`~.Function` on the serial submesh.
+    Parameters
+    ----------
+    mesh : MeshGeometry
+        The mesh, distributed or not.
+    target_size : int
+        The target number of cells per subdomain.
+    ignore_halo : bool
+        Whether the submesh excludes the halo, as in :func:`local_mesh`.
+
+    Returns
+    -------
+    Function
+        A DG(0) :class:`~.Function` on the serial submesh.
     """
     submesh = local_mesh(mesh, ignore_halo)
     if submesh is None:
@@ -209,7 +236,12 @@ def split_disconnected(xadj, adjncy, ids, nsub):
     subdomain of its own and empty subdomains are dropped, so the number of
     subdomains returned may differ from the number requested.
 
-    :returns: ``(ids, nsub)``, renumbered contiguously from zero.
+    Returns
+    -------
+    ids : numpy.ndarray
+        The subdomain id of each vertex, renumbered contiguously from zero.
+    nsub : int
+        The resulting number of subdomains.
     """
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
@@ -232,15 +264,30 @@ def split_disconnected(xadj, adjncy, ids, nsub):
 def subdomain_numbering(V, subdomains, ignore_halo=True):
     """Relate the cell-broken degrees of freedom of ``V`` to a subdomain numbering.
 
-    :arg V: the global function space.
-    :arg subdomains: a DG(0) :class:`~.Function` on the serial submesh holding
-        the subdomain id of each cell, as returned by :func:`partition_cells`.
-    :returns: ``(collapse, size, indices, subdomain_sizes)``.  ``collapse``
-        sends each cell-broken degree of freedom to its position in a numbering
-        that lists the subdomains one after another, ``size`` is the length of
-        that numbering, ``indices`` sends it to the global numbering of ``V``,
-        and ``subdomain_sizes`` counts the degrees of freedom of each subdomain.
+    Parameters
+    ----------
+    V : FunctionSpace
+        The global function space.
+    subdomains : Function
+        A DG(0) :class:`~.Function` on the serial submesh holding the subdomain
+        id of each cell, as returned by :func:`partition_cells`.
+    ignore_halo : bool
+        Whether the submesh excludes the halo, as in :func:`local_mesh`.
 
+    Returns
+    -------
+    collapse : numpy.ndarray
+        Sends each cell-broken degree of freedom to its position in a numbering
+        that lists the subdomains one after another.
+    size : int
+        The length of that numbering.
+    indices : numpy.ndarray
+        Sends that numbering to the global numbering of ``V``.
+    subdomain_sizes : numpy.ndarray
+        The number of degrees of freedom of each subdomain.
+
+    Notes
+    -----
     The subdomains occupy contiguous ranges of the new numbering, which is what
     ``PCBDDC`` needs in order to read them back from the variable block sizes.
     """
@@ -318,9 +365,20 @@ def gather(vec, indices, comm):
 def dof_multiplicity(V, indices, comm):
     """Count how many subdomains hold each degree of freedom of the subdomain matrix.
 
-    :arg indices: the local-to-global map of the subdomain matrix, which lists
-        a global degree of freedom once for every subdomain holding it.
-    :returns: the multiplicity of each entry of ``indices``.
+    Parameters
+    ----------
+    V : FunctionSpace
+        The global function space.
+    indices : numpy.ndarray
+        The local-to-global map of the subdomain matrix, which lists a global
+        degree of freedom once for every subdomain holding it.
+    comm : mpi4py.MPI.Comm
+        The communicator of the global operator.
+
+    Returns
+    -------
+    numpy.ndarray
+        The multiplicity of each entry of ``indices``.
     """
     vec = V.dof_dset.layout_vec.duplicate()
     vec.zeroEntries()
@@ -396,18 +454,24 @@ LocalNeumannMatrix = namedtuple(
     ("mat", "rmap", "cmap", "subdomain_sizes", "comm", "sizes", "update"))
 """The subdomain matrix of a form, and the maps relating it to the global problem.
 
-``mat``
-    the sequential subdomain matrix, with degrees of freedom grouped by subdomain;
-``rmap``, ``cmap``
-    maps from its degrees of freedom to the global numbering of the test and
-    trial spaces, repeating global indices when there is more than one subdomain;
-``subdomain_sizes``
-    the number of degrees of freedom of each subdomain, or ``None`` when there
-    is a single subdomain per process;
-``comm``, ``sizes``
-    the communicator and global sizes of the operator;
-``update``
-    reassembles ``mat`` in place.
+Attributes
+----------
+mat : PETSc.Mat
+    The sequential subdomain matrix, with degrees of freedom grouped by
+    subdomain.
+rmap, cmap : PETSc.LGMap
+    Maps from its degrees of freedom to the global numbering of the test and
+    trial spaces, repeating global indices when there is more than one
+    subdomain.
+subdomain_sizes : numpy.ndarray or None
+    The number of degrees of freedom of each subdomain, or ``None`` when there
+    is a single subdomain per process.
+comm : mpi4py.MPI.Comm
+    The communicator of the operator.
+sizes : tuple
+    The global sizes of the operator.
+update : callable
+    Reassembles ``mat`` in place.
 """
 
 
@@ -415,19 +479,30 @@ def local_neumann_matrix(a, local_mat_type, cellwise=False, bcs=(),
                          ignore_halo=True, subdomains=None):
     """Assemble the subdomain (Neumann) matrix of a form on the serial submesh.
 
-    :arg a: a :class:`~ufl.Form`, or a ``python`` :class:`PETSc.Mat` wrapping one.
-    :arg local_mat_type: the ``Mat`` type of the subdomain matrix.
-    :arg cellwise: break the local space across cells, making every cell a
-        subdomain.
-    :arg bcs: Dirichlet conditions, ignored if ``a`` is a ``Mat``, which
-        carries its own.
-    :kwarg ignore_halo: whether the submesh excludes the halo.  ``True`` gives
-        the non-overlapping subdomains wanted by ``PCBDDC``; ``False`` gives
-        overlapping ones.
-    :kwarg subdomains: a DG(0) :class:`~.Function` partitioning the cells of the
-        submesh, giving several subdomains per process.  Mutually exclusive
-        with ``cellwise``.
-    :returns: a :class:`LocalNeumannMatrix`.
+    Parameters
+    ----------
+    a : ufl.Form or PETSc.Mat
+        The bilinear form, or a ``python`` :class:`PETSc.Mat` wrapping one.
+    local_mat_type : str
+        The ``Mat`` type of the subdomain matrix.
+    cellwise : bool
+        Break the local space across cells, making every cell a subdomain.
+    bcs : tuple
+        Dirichlet conditions, ignored if ``a`` is a ``Mat``, which carries its
+        own.
+    ignore_halo : bool
+        Whether the submesh excludes the halo.  ``True`` gives the
+        non-overlapping subdomains wanted by ``PCBDDC``; ``False`` gives the
+        overlapping ones wanted by ``PCHPDDM``.
+    subdomains : Function
+        A DG(0) :class:`~.Function` partitioning the cells of the submesh,
+        giving several subdomains per process.  Mutually exclusive with
+        ``cellwise``.
+
+    Returns
+    -------
+    LocalNeumannMatrix
+        The subdomain matrix and the maps relating it to the global problem.
     """
     from firedrake.assemble import get_assembler
 
@@ -544,7 +619,12 @@ def local_neumann_matrix(a, local_mat_type, cellwise=False, bcs=(),
 def create_matis(a, local_mat_type, cellwise=False, bcs=(), subdomains=None):
     """Assemble a form as a ``Mat`` of type ``is``.
 
-    :returns: ``(Amatis, update)``, where calling ``update`` reassembles it.
+    Returns
+    -------
+    Amatis : PETSc.Mat
+        The operator as a ``Mat`` of type ``is``.
+    update : callable
+        Reassembles ``Amatis`` in place.
     """
     local = local_neumann_matrix(a, local_mat_type, cellwise=cellwise, bcs=bcs,
                                  subdomains=subdomains)
