@@ -95,7 +95,7 @@ def _skip_test_dependency(dependency):
         except ImportError:
             return skip
 
-    elif dependency in ("mumps", "hypre"):
+    elif dependency in ("mumps", "hypre", "hpddm"):
         return dependency not in get_external_packages()
 
     else:
@@ -105,6 +105,7 @@ def _skip_test_dependency(dependency):
 dependency_skip_markers_and_reasons = (
     ("mumps", "skipmumps", "MUMPS not installed with PETSc"),
     ("hypre", "skiphypre", "hypre not installed with PETSc"),
+    ("hpddm", "skiphpddm", "HPDDM not installed with PETSc"),
     ("slepc", "skipslepc", "SLEPc is not installed"),
     ("pytorch", "skiptorch", "PyTorch is not installed"),
     ("jax", "skipjax", "JAX is not installed"),
@@ -129,6 +130,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "skiphypre: mark as skipped unless hypre is installed"
+    )
+    config.addinivalue_line(
+        "markers",
+        "skiphpddm: mark as skipped unless HPDDM is installed"
     )
     config.addinivalue_line(
         "markers",
